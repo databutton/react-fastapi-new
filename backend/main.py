@@ -4,7 +4,17 @@ import json
 import dotenv
 from fastapi import FastAPI, APIRouter, Depends
 
-dotenv.load_dotenv()
+# Load environment files
+# First load shared .env file
+dotenv.load_dotenv(".env")
+
+# Then load environment-specific file (defaults to dev)
+# Environment-specific values will override shared values
+environment = os.getenv("ENV", "dev")
+env_file = f".env.{environment}"
+dotenv.load_dotenv(env_file, override=True)
+
+print(f"Loaded environment: {environment}")
 
 from databutton_app.mw.auth_mw import AuthConfig, get_authorized_user
 
@@ -24,7 +34,7 @@ def is_auth_disabled(router_config: dict, name: str) -> bool:
 
 def import_api_routers() -> APIRouter:
     """Create top level router including all user defined endpoints."""
-    routes = APIRouter(prefix="/routes")
+    routes = APIRouter(prefix="/api")
 
     router_config = get_router_config()
 
