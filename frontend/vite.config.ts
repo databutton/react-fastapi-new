@@ -47,7 +47,7 @@ const buildVariables = () => {
 
 	const defines: Record<string, string> = {
 		__APP_ID__: JSON.stringify(appId),
-		__API_PATH__: JSON.stringify(""),
+		__API_PATH__: JSON.stringify(process.env.API_PATH),
 		__API_HOST__: JSON.stringify(""),
 		__API_PREFIX_PATH__: JSON.stringify(""),
 		__API_URL__: JSON.stringify("http://localhost:8000"),
@@ -74,7 +74,7 @@ export default defineConfig({
 	plugins: [react(), splitVendorChunkPlugin(), tsConfigPaths(), injectHTML()],
 	server: {
 		proxy: {
-			"/routes": {
+			"/api": {
 				target: "http://127.0.0.1:8000",
 				changeOrigin: true,
 			},
