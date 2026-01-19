@@ -84,6 +84,48 @@ def get_firebase_config() -> dict | None:
     return None
 
 
+def get_stack_auth_config() -> dict | None:
+    extensions = os.environ.get("DATABUTTON_EXTENSIONS", "[]")
+    extensions = json.loads(extensions)
+
+    for ext in extensions:
+        if ext["name"] == "stack-auth":
+            return ext["config"]
+
+    return None
+
+
+def parse_auth_configs() -> list[AuthConfig]:
+    """Parse auth configs from both firebase-auth and stack-auth extensions."""
+    auth_configs: list[AuthConfig] = []
+
+    # Add stack-auth config if extension is enabled
+    stack_auth_cfg = get_stack_auth_config()
+    if stack_auth_cfg:
+        project_id = stack_auth_cfg["projectId"]
+        auth_configs.append(
+            AuthConfig(
+                issuer=f"https://api.stack-auth.com/api/v1/projects/{project_id}",
+                jwks_url=stack_auth_cfg["jwksUrl"],
+                audience=project_id,
+            )
+        )
+
+    # Add firebase auth config if extension is enabled
+    firebase_cfg = get_firebase_config()
+    if firebase_cfg:
+        project_id = firebase_cfg["projectId"]
+        auth_configs.append(
+            AuthConfig(
+                issuer=f"https://securetoken.google.com/{project_id}",
+                jwks_url="https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com",
+                audience=project_id,
+            )
+        )
+
+    return auth_configs
+
+
 def create_app() -> FastAPI:
     """Create the app. This is called by uvicorn with the factory option to construct the app object."""
     app = FastAPI()
@@ -94,20 +136,14 @@ def create_app() -> FastAPI:
             for method in route.methods:
                 print(f"{method} {route.path}")
 
-    firebase_config = get_firebase_config()
+    auth_configs = parse_auth_configs()
 
-    if firebase_config is None:
-        print("No firebase config found")
-        app.state.auth_config = None
+    if len(auth_configs) == 0:
+        print("No auth extensions found")
+        app.state.auth_configs = None
     else:
-        print("Firebase config found")
-        auth_config = {
-            "jwks_url": "https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com",
-            "audience": firebase_config["projectId"],
-            "header": "authorization",
-        }
-
-        app.state.auth_config = AuthConfig(**auth_config)
+        print(f"Found {len(auth_configs)} auth config(s)")
+        app.state.auth_configs = auth_configs
 
     return app
 

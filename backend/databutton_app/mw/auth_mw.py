@@ -10,9 +10,10 @@ from starlette.requests import Request
 
 
 class AuthConfig(BaseModel):
+    issuer: str
     jwks_url: str
-    audience: str
-    header: str
+    audience: str | None = None
+    audiences: tuple[str, ...] = ()
 
 
 class User(BaseModel):
@@ -26,17 +27,17 @@ class User(BaseModel):
     email: str | None = None
 
 
-def get_auth_config(request: HTTPConnection) -> AuthConfig:
-    auth_config: AuthConfig | None = request.app.state.auth_config
+def get_auth_configs(request: HTTPConnection) -> list[AuthConfig]:
+    auth_configs: list[AuthConfig] | None = request.app.state.auth_configs
 
-    if auth_config is None:
+    if auth_configs is None or len(auth_configs) == 0:
         raise HTTPException(
             status_code=HTTPStatus.UNAUTHORIZED, detail="No auth config"
         )
-    return auth_config
+    return auth_configs
 
 
-AuthConfigDep = Annotated[AuthConfig, Depends(get_auth_config)]
+AuthConfigsDep = Annotated[list[AuthConfig], Depends(get_auth_configs)]
 
 
 def get_audit_log(request: HTTPConnection) -> Callable[[str], None] | None:
@@ -48,14 +49,13 @@ AuditLogDep = Annotated[Callable[[str], None] | None, Depends(get_audit_log)]
 
 def get_authorized_user(
     request: HTTPConnection,
+    auth_configs: AuthConfigsDep,
 ) -> User:
-    auth_config = get_auth_config(request)
-
     try:
         if isinstance(request, WebSocket):
-            user = authorize_websocket(request, auth_config)
+            user = authorize_websocket(request, auth_configs)
         elif isinstance(request, Request):
-            user = authorize_request(request, auth_config)
+            user = authorize_request(request, auth_configs)
         else:
             raise ValueError("Unexpected request type")
 
@@ -75,6 +75,9 @@ def get_authorized_user(
         )
 
 
+AuthorizedUser = Annotated[User, Depends(get_authorized_user)]
+
+
 @functools.cache
 def get_jwks_client(url: str):
     """Reuse client cached by its url, client caches keys by default."""
@@ -86,14 +89,14 @@ def get_signing_key(url: str, token: str) -> tuple[str, str]:
     signing_key = client.get_signing_key_from_jwt(token)
     key = signing_key.key
     alg = signing_key.algorithm_name
-    if alg != "RS256":
+    if alg not in ("RS256", "ES256"):
         raise ValueError(f"Unsupported signing algorithm: {alg}")
     return (key, alg)
 
 
 def authorize_websocket(
     request: WebSocket,
-    auth_config: AuthConfig,
+    auth_configs: list[AuthConfig],
 ) -> User | None:
     # Parse Sec-Websocket-Protocol
     header = "Sec-Websocket-Protocol"
@@ -114,39 +117,66 @@ def authorize_websocket(
         print(f"Missing bearer {prefix}.<token> in protocols")
         return None
 
-    return authorize_token(token, auth_config)
+    return authorize_token(token, auth_configs)
 
 
 def authorize_request(
     request: Request,
-    auth_config: AuthConfig,
+    auth_configs: list[AuthConfig],
 ) -> User | None:
-    auth_header = request.headers.get(auth_config.header)
+    auth_header = request.headers.get("authorization")
     if not auth_header:
-        print(f"Missing header '{auth_config.header}'")
+        print("Missing header 'authorization'")
         return None
 
-    token = auth_header.startswith("Bearer ") and auth_header[7:]
+    token = auth_header.startswith("Bearer ") and auth_header.removeprefix("Bearer ")
     if not token:
-        print(f"Missing bearer token in '{auth_config.header}'")
+        print("Missing bearer token in 'authorization'")
         return None
 
-    return authorize_token(token, auth_config)
+    return authorize_token(token, auth_configs)
 
 
 def authorize_token(
     token: str,
-    auth_config: AuthConfig,
+    auth_configs: list[AuthConfig],
 ) -> User | None:
-    # Audience and jwks url to get signing key from based on the users config
-    jwks_urls = [(auth_config.audience, auth_config.jwks_url)]
+    # Partially parse token without verification to get issuer and audience
+    try:
+        unverified_payload = jwt.decode(
+            token,
+            options={
+                "verify_signature": False,
+                "verify_aud": False,
+                "verify_iss": False,
+            },
+        )
+        token_iss: str | None = unverified_payload.get("iss")
+        token_aud: str | None = unverified_payload.get("aud")
+    except Exception as e:
+        print(f"Failed to decode token: {e}")
+        return None
 
-    payload = None
-    for audience, jwks_url in jwks_urls:
+    # Try to validate with each auth config
+    for auth_config in auth_configs:
+        # Check if issuer matches
+        if token_iss != auth_config.issuer:
+            continue
+
+        # Determine expected audience
+        audiences: tuple[str, ...] = (
+            (auth_config.audience,) if auth_config.audience is not None else auth_config.audiences
+        )
+        
+        if token_aud not in audiences:
+            print(f"Audience mismatch: {token_aud} not in {audiences}")
+            continue
+
+        # Validate token with full verification
         try:
-            key, alg = get_signing_key(jwks_url, token)
+            key, alg = get_signing_key(auth_config.jwks_url, token)
         except Exception as e:
-            print(f"Failed to get signing key {e}")
+            print(f"Failed to get signing key: {e}")
             continue
 
         try:
@@ -154,16 +184,20 @@ def authorize_token(
                 token,
                 key=key,
                 algorithms=[alg],
-                audience=audience,
+                audience=token_aud,
             )
         except jwt.PyJWTError as e:
-            print(f"Failed to decode and validate token {e}")
+            print(f"Failed to decode and validate token: {e}")
             continue
 
-    try:
-        user = User.model_validate(payload)
-        print(f"User {user.sub} authenticated")
-        return user
-    except Exception as e:
-        print(f"Failed to parse token payload {e}")
-        return None
+        # Parse user from payload
+        try:
+            user = User.model_validate(payload)
+            print(f"User {user.sub} authenticated")
+            return user
+        except Exception as e:
+            print(f"Failed to parse token payload: {e}")
+            continue
+
+    print("Failed to validate authorization token with any auth config")
+    return None
